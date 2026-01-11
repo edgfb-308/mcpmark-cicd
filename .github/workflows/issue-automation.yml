@@ -1,0 +1,236 @@
+name: Issue Management Automation
+on:
+  issues:
+    types: [opened, labeled]
+
+jobs:
+  issue-triage:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run issue triage
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const issueNumber = context.issue.number;
+            const issue = await octokit.rest.issues.get({ owner, repo, issue_number: issueNumber });
+            const title = issue.data.title.toLowerCase();
+            const body = (issue.data.body || "").toLowerCase();
+
+            // Define required labels
+            const requiredLabels = [
+              { name: "bug", color: "#d73a4a", description: "Something isn't working" },
+              { name: "enhancement", color: "#a2eeef", description: "New feature or request" },
+              { name: "epic", color: "#7057ff", description: "Large feature requiring multiple sub-tasks" },
+              { name: "maintenance", color: "#d876e3", description: "Maintenance and housekeeping tasks" },
+              { name: "priority-critical", color: "#b60205", description: "Critical priority issue" },
+              { name: "priority-high", color: "#d93f09", description: "High priority issue" },
+              { name: "priority-medium", color: "#d9b310", description: "Medium priority issue" },
+              { name: "priority-low", color: "#2ecc71", description: "Low priority issue" },
+              { name: "needs-triage", color: "#fef2c0", description: "Needs to be reviewed by maintainers" },
+              { name: "needs-review", color: "#bfe5bf", description: "Awaiting review from maintainers" },
+              { name: "first-time-contributor", color: "#107c10", description: "Issue created by first-time contributor" }
+            ];
+
+            // Create missing labels
+            const existingLabels = await octokit.rest.issues.listLabelsForRepo({ owner, repo });
+            const existingLabelNames = existingLabels.data.map(l => l.name);
+            for (const label of requiredLabels) {
+              if (!existingLabelNames.includes(label.name)) {
+                await octokit.rest.issues.createLabel({
+                  owner,
+                  repo,
+                  name: label.name,
+                  color: label.color,
+                  description: label.description
+                });
+              }
+            }
+
+            // Add needs-triage label
+            await octokit.rest.issues.addLabels({
+              owner,
+              repo,
+              issue_number: issueNumber,
+              labels: ["needs-triage"]
+            });
+
+            // Add category label based on title
+            let categoryLabel = null;
+            if (title.includes("bug")) {
+              categoryLabel = "bug";
+            } else if (title.includes("epic")) {
+              categoryLabel = "epic";
+            } else if (title.includes("maintenance")) {
+              categoryLabel = "maintenance";
+            }
+            if (categoryLabel) {
+              await octokit.rest.issues.addLabels({
+                owner,
+                repo,
+                issue_number: issueNumber,
+                labels: [categoryLabel]
+              });
+            }
+
+            // Add priority label based on title/body
+            let priorityLabel = "priority-medium"; // default
+            const priorityKeywords = [
+              { label: "priority-critical", keywords: ["critical", "urgent", "production", "outage"] },
+              { label: "priority-high", keywords: ["important", "high", "blocking"] },
+              { label: "priority-low", keywords: ["low", "nice-to-have", "minor"] }
+            ];
+            for (const priority of priorityKeywords) {
+              const hasKeyword = priority.keywords.some(k => title.includes(k) || body.includes(k));
+              if (hasKeyword) {
+                priorityLabel = priority.label;
+                break;
+              }
+            }
+            await octokit.rest.issues.addLabels({
+              owner,
+              repo,
+              issue_number: issueNumber,
+              labels: [priorityLabel]
+            });
+
+  task-breakdown:
+    runs-on: ubuntu-latest
+    needs: issue-triage
+    if: ${{ contains(github.event.issue.labels.*.name, 'epic') }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Create epic subtasks
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const parentIssueNumber = context.issue.number;
+            const parentIssue = await octokit.rest.issues.get({ owner, repo, issue_number: parentIssueNumber });
+            const parentTitle = parentIssue.data.title;
+
+            // Define subtasks
+            const subtasks = [
+              { number: 1, name: "Requirements Analysis" },
+              { number: 2, name: "Design and Architecture" },
+              { number: 3, name: "Implementation" },
+              { number: 4, name: "Testing and Documentation" }
+            ];
+
+            // Create subtasks and collect their numbers
+            const subtaskNumbers = [];
+            for (const task of subtasks) {
+              const subtaskTitle = `[SUBTASK] ${parentTitle} - Task ${task.number}: ${task.name}`;
+              const subtaskBody = `Related to #${parentIssueNumber}`;
+              const subtask = await octokit.rest.issues.create({
+                owner,
+                repo,
+                title: subtaskTitle,
+                body: subtaskBody,
+                labels: ["enhancement", "needs-review"]
+              });
+              subtaskNumbers.push(subtask.data.number);
+            }
+
+            // Update parent issue with epic tasks checklist
+            const newBody = `${parentIssue.data.body || ""}\n\n## Epic Tasks\n- [ ] Task 1: Requirements Analysis (#${subtaskNumbers[0]})\n- [ ] Task 2: Design and Architecture (#${subtaskNumbers[1]})\n- [ ] Task 3: Implementation (#${subtaskNumbers[2]})\n- [ ] Task 4: Testing and Documentation (#${subtaskNumbers[3]})`;
+            await octokit.rest.issues.update({
+              owner,
+              repo,
+              issue_number: parentIssueNumber,
+              body: newBody
+            });
+
+  auto-response:
+    runs-on: ubuntu-latest
+    needs: issue-triage
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run auto-response
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const issueNumber = context.issue.number;
+            const issue = await octokit.rest.issues.get({ owner, repo, issue_number: issueNumber });
+            const author = issue.data.user.login;
+            const labels = issue.data.labels.map(l => l.name);
+
+            // Check if first issue in repo
+            const authorIssues = await octokit.rest.issues.listForRepo({
+              owner,
+              repo,
+              creator: author,
+              state: "all",
+              per_page: 100
+            });
+            const isFirstIssue = authorIssues.data.length === 1;
+            if (isFirstIssue) {
+              await octokit.rest.issues.addLabels({
+                owner,
+                repo,
+                issue_number: issueNumber,
+                labels: ["first-time-contributor"]
+              });
+            }
+
+            // Post comment based on category label
+            let commentBody = "";
+            if (labels.includes("bug")) {
+              commentBody = "Thank you for reporting this bug! Please review our Bug Report Guidelines to ensure we have all the necessary information to resolve this issue.";
+            } else if (labels.includes("epic")) {
+              commentBody = "Thank you for submitting this epic feature request! Please review our Feature Request Process to understand how we'll break this down into actionable tasks.";
+            } else if (labels.includes("maintenance")) {
+              commentBody = "Thank you for submitting this maintenance task! Please review our Maintenance Guidelines to ensure this task aligns with our maintenance priorities.";
+            }
+            if (commentBody) {
+              await octokit.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: issueNumber,
+                body: commentBody
+              });
+            }
+
+            // Set milestone for high/critical priority
+            if (labels.includes("priority-high") || labels.includes("priority-critical")) {
+              // Check if milestone exists
+              const milestones = await octokit.rest.issues.listMilestonesForRepo({ owner, repo });
+              let milestone = milestones.data.find(m => m.title === "v1.0.0");
+              if (!milestone) {
+                // Create milestone if not exists
+                milestone = await octokit.rest.issues.createMilestone({
+                  owner,
+                  repo,
+                  title: "v1.0.0"
+                });
+              }
+              // Set milestone on issue
+              await octokit.rest.issues.update({
+                owner,
+                repo,
+                issue_number: issueNumber,
+                milestone: milestone.data.number
+              });
+            }
+
+            // Update status from needs-triage to needs-review
+            await octokit.rest.issues.removeLabel({
+              owner,
+              repo,
+              issue_number: issueNumber,
+              name: "needs-triage"
+            });
+            await octokit.rest.issues.addLabels({
+              owner,
+              repo,
+              issue_number: issueNumber,
+              labels: ["needs-review"]
+            });
